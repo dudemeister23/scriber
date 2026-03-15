@@ -26,6 +26,7 @@ from .audio import AudioRecorder
 # Hotkey presets: (display label, config value)
 HOTKEY_PRESETS = [
     ("Hold Control", "control"),
+    ("Hold Fn (Globe)", "fn"),
     ("Hold Option", "option"),
     ("Hold Command", "command"),
     ("Cmd+Shift+Space (toggle)", "cmd+shift+space"),

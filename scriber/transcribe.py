@@ -5,6 +5,7 @@ import logging
 import os
 from datetime import datetime
 
+import certifi
 import requests
 
 from .config import LOG_FILE, ensure_config_dir
@@ -40,7 +41,10 @@ def transcribe(
         for i, term in enumerate(keyterms[:100]):
             data[f"keyterms[{i}]"] = term
 
-    response = requests.post(API_URL, headers=headers, files=files, data=data, timeout=120)
+    response = requests.post(
+        API_URL, headers=headers, files=files, data=data,
+        timeout=120, verify=certifi.where(),
+    )
 
     _log_response(response)
 

@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import threading
+import time
 
 import rumps
 from AVFoundation import (
@@ -199,8 +200,24 @@ class ScribeApp(rumps.App):
         try:
             api_key = get_api_key(self.config)
             if not api_key:
-                rumps.notification("Scriber", "No API Key", "Please set your API key in Settings.")
+                self._overlay.show_error("No API key — open Settings")
+                self._reset_ui()
+                self._transcribing = False
                 return
+
+            # Start elapsed-time updater
+            start_time = time.time()
+            self._transcribe_done = False
+
+            def _update_elapsed():
+                while not self._transcribe_done:
+                    elapsed = int(time.time() - start_time)
+                    if elapsed >= 3:
+                        self._overlay.update_status(f"Transcribing\u2026 {elapsed}s")
+                    time.sleep(1.0)
+
+            timer_thread = threading.Thread(target=_update_elapsed, daemon=True)
+            timer_thread.start()
 
             text = transcribe(
                 audio_data,
@@ -208,6 +225,7 @@ class ScribeApp(rumps.App):
                 language=self.config.get("language", ""),
                 keyterms=self.config.get("keyterms"),
             )
+            self._transcribe_done = True
 
             if text:
                 # API omits trailing period on final sentence — add one if missing
@@ -217,14 +235,29 @@ class ScribeApp(rumps.App):
                 logger.info("Transcript received (%d chars): %s", len(text), text[:80])
                 paste_text(text + " ")
                 logger.info("Paste completed")
+                self._overlay.hide()
             else:
-                rumps.notification("Scriber", "Empty Transcript", "No speech was detected.")
+                self._overlay.show_error("No speech detected")
         except Exception as e:
-            rumps.notification("Scriber", "Transcription Error", str(e))
+            self._transcribe_done = True
+            error_msg = str(e)
             logger.error("Transcription failed: %s", e)
+            # Show a user-friendly error in the overlay
+            if "500" in error_msg:
+                self._overlay.show_error("API server error — try again")
+            elif "401" in error_msg or "403" in error_msg:
+                self._overlay.show_error("Invalid API key")
+            elif "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                self._overlay.show_error("Request timed out — try again")
+            elif "certificate" in error_msg.lower() or "ssl" in error_msg.lower():
+                self._overlay.show_error("SSL error — check connection")
+            else:
+                # Truncate long errors
+                short = error_msg[:60] + "\u2026" if len(error_msg) > 60 else error_msg
+                self._overlay.show_error(short)
         finally:
+            self._transcribe_done = True
             self._transcribing = False
-            self._overlay.hide()
             self._reset_ui()
 
     # --- Streaming mode ---
@@ -334,7 +367,8 @@ class ScribeApp(rumps.App):
     def _on_streaming_error(self, error_msg: str):
         """Called from WebSocket recv thread on API error."""
         logger.error("Streaming error: %s", error_msg)
-        rumps.notification("Scriber", "Streaming Error", error_msg)
+        short = error_msg[:60] + "\u2026" if len(error_msg) > 60 else error_msg
+        self._overlay.show_error(short)
 
     # --- UI ---
 

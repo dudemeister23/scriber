@@ -55,6 +55,8 @@ MODIFIER_MAP = {
     "option": kCGEventFlagMaskAlternate,
     "ctrl": kCGEventFlagMaskControl,
     "control": kCGEventFlagMaskControl,
+    "fn": 1 << 23,        # kCGEventFlagMaskSecondaryFn
+    "globe": 1 << 23,
 }
 
 # NSEvent modifier flag equivalents
@@ -67,9 +69,14 @@ NS_MODIFIER_MAP = {
     "option": 1 << 19,
     "ctrl": 1 << 18,      # NSEventModifierFlagControl
     "control": 1 << 18,
+    "fn": 1 << 23,        # NSEventModifierFlagFunction
+    "globe": 1 << 23,
 }
 
-HOLD_MODIFIERS = {"cmd", "cmd_r", "command", "shift", "alt", "option", "ctrl", "control"}
+# Virtual keycode for the physical Fn/Globe key
+_FN_KEYCODE = 63
+
+HOLD_MODIFIERS = {"cmd", "cmd_r", "command", "shift", "alt", "option", "ctrl", "control", "fn", "globe"}
 
 
 def parse_hotkey(hotkey_str: str):
@@ -124,6 +131,7 @@ class GlobalHotkey:
 
         if self._mode == "hold":
             self._modifier_flag = parsed[1]
+            self._is_fn = hotkey_str.strip().lower() in ("fn", "globe")
             self._held = False
             self._press_time = 0.0
         else:
@@ -157,6 +165,11 @@ class GlobalHotkey:
 
     def _handle_flags_changed(self, event):
         """Handle modifier key press/release for hold mode."""
+        # For Fn/Globe, only respond to the physical Fn key (keyCode 63),
+        # not F1-F12 which also set the function modifier flag.
+        if self._is_fn and event.keyCode() != _FN_KEYCODE:
+            return
+
         flags = event.modifierFlags()
         modifier_active = bool(flags & self._modifier_flag)
 

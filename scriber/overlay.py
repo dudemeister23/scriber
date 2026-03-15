@@ -64,6 +64,7 @@ class OverlayContentView(NSView):
         self._status_text = "Recording\u2026"
         self._pulse_phase = 0.0
         self._is_recording = True
+        self._is_error = False
         self._streaming_mode = False
         self._tick = 0
 
@@ -106,7 +107,10 @@ class OverlayContentView(NSView):
         dot_x = 18.0
         dot_y = status_center_y
 
-        if self._is_recording:
+        if self._is_error:
+            # Error state — red dot, no pulse
+            NSColor.colorWithRed_green_blue_alpha_(1.0, 0.2, 0.15, 0.9).set()
+        elif self._is_recording:
             pulse = 0.5 + 0.5 * math.sin(self._pulse_phase)
             self._pulse_phase += 0.12
 
@@ -190,11 +194,13 @@ class OverlayContentView(NSView):
                     glow_path.fill()
 
         # Status text (next to dot)
+        if self._is_error:
+            text_color = NSColor.colorWithRed_green_blue_alpha_(1.0, 0.4, 0.35, 0.95)
+        else:
+            text_color = NSColor.colorWithRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.85)
         status_attrs = {
             NSFontAttributeName: NSFont.systemFontOfSize_(11.0),
-            NSForegroundColorAttributeName: NSColor.colorWithRed_green_blue_alpha_(
-                1.0, 1.0, 1.0, 0.85
-            ),
+            NSForegroundColorAttributeName: text_color,
         }
         text = NSString.stringWithString_(self._status_text)
         text_size = text.sizeWithAttributes_(status_attrs)
@@ -379,6 +385,7 @@ class RecordingOverlay:
     def show(self, status="Recording\u2026", streaming=False):
         self._content_view._status_text = status
         self._content_view._is_recording = True
+        self._content_view._is_error = False
         self._content_view._streaming_mode = streaming
         self._content_view._committed_text = ""
         self._content_view._partial_text = ""
@@ -425,6 +432,18 @@ class RecordingOverlay:
         if self._content_view._partial_text:
             parts.append(self._content_view._partial_text)
         return " ".join(parts) if parts else ""
+
+    def show_error(self, message):
+        """Show an error message in the overlay, then auto-hide after 3 seconds."""
+        self._content_view._status_text = message
+        self._content_view._is_recording = False
+        self._content_view._is_error = True
+        self._content_view.setNeedsDisplay_(True)
+        logger.debug("Overlay error: %s", message)
+        # Auto-hide after 3 seconds
+        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            3.0, self._hide_target, "doHide:", None, False
+        )
 
     def hide(self):
         """Hide the overlay. Safe to call from any thread."""
