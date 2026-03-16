@@ -29,8 +29,22 @@ echo "==> Building .app bundle..."
 python3 setup.py py2app --no-strip 2>&1
 
 echo "==> Code signing..."
-xattr -rc dist/Scriber.app
-codesign --deep --force --sign "$SIGNING_IDENTITY" dist/Scriber.app
+# macOS adds provenance xattrs that block codesigning.
+# Copy to /tmp (outside APFS provenance tracking), sign there, copy back.
+rm -rf /tmp/Scriber.app
+ditto --norsrc dist/Scriber.app /tmp/Scriber.app
+xattr -cr /tmp/Scriber.app 2>/dev/null || true
+# Recreate symlinks without xattrs
+find /tmp/Scriber.app -type l | while read link; do
+    target=$(readlink "$link")
+    rm "$link"
+    ln -s "$target" "$link"
+done
+codesign --deep --force --sign "$SIGNING_IDENTITY" /tmp/Scriber.app
+# Copy signed app back
+rm -rf dist/Scriber.app
+cp -R /tmp/Scriber.app dist/Scriber.app
+rm -rf /tmp/Scriber.app
 if [ "$SIGNING_IDENTITY" = "-" ]; then
     echo "    Signed: ad-hoc (permissions may reset on rebuild)"
     echo "    Tip: Set SCRIBER_SIGNING_IDENTITY to your Apple Developer identity"

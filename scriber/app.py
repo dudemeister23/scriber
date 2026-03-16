@@ -18,8 +18,9 @@ from . import __version__
 from .audio import AudioRecorder
 from .config import CONFIG_FILE, load_config, save_config, get_api_key
 from .overlay import RecordingOverlay
-from .paste import paste_text, _check_accessibility
+from .paste import paste_text, PasteError, _check_accessibility
 from .settings_window import SettingsWindowController
+from .local_transcribe import is_model_downloaded, transcribe_local
 from .streaming import StreamingTranscriber
 from .transcribe import transcribe
 
@@ -63,12 +64,23 @@ class ScribeApp(rumps.App):
         self.status_item = rumps.MenuItem("Ready")
         self.status_item.set_callback(None)
 
-        self._mode_item = rumps.MenuItem(self._mode_label(), callback=self._toggle_mode)
+        self._mode_menu = rumps.MenuItem("Mode")
+        self._mode_items = {}
+        for label, value in [
+            ("Batch (Scribe V2)", "batch"),
+            ("Streaming (Scribe V2 RT)", "streaming"),
+            ("Local (Granite 4.0)", "local"),
+        ]:
+            item = rumps.MenuItem(label, callback=self._select_mode)
+            item._mode_value = value
+            self._mode_items[value] = item
+            self._mode_menu.add(item)
+        self._update_mode_checkmarks()
 
         self.menu = [
             self.status_item,
             None,
-            self._mode_item,
+            self._mode_menu,
             rumps.MenuItem("Settings\u2026", callback=self._open_settings),
             None,
             rumps.MenuItem(f"Scriber v{__version__}"),
@@ -149,6 +161,14 @@ class ScribeApp(rumps.App):
         logger.info("Recording mode: %s", mode)
         if mode == "streaming":
             self._start_streaming()
+        elif mode == "local":
+            if not is_model_downloaded():
+                self.recorder.stop()
+                self._overlay.show("Recording\u2026")
+                self._overlay.show_error("Model not downloaded \u2014 open Settings")
+                self._reset_ui()
+                return
+            self._overlay.show("Recording\u2026")
         else:
             self._overlay.show("Recording\u2026")
 
@@ -163,7 +183,7 @@ class ScribeApp(rumps.App):
             self._stop_streaming()
             return
 
-        # Batch mode
+        # Batch / Local mode
         self._transcribing = True
         self.status_item.title = "Transcribing\u2026"
 
@@ -174,9 +194,13 @@ class ScribeApp(rumps.App):
         else:
             self.title = "\u231b"
 
-        self._overlay.update_status("Transcribing\u2026")
-
-        thread = threading.Thread(target=self._do_transcribe, args=(audio_data,), daemon=True)
+        mode = self.config.get("mode", "batch")
+        if mode == "local":
+            self._overlay.update_status("Transcribing locally\u2026")
+            thread = threading.Thread(target=self._do_transcribe_local, args=(audio_data,), daemon=True)
+        else:
+            self._overlay.update_status("Transcribing\u2026")
+            thread = threading.Thread(target=self._do_transcribe, args=(audio_data,), daemon=True)
         thread.start()
 
     def cancel_recording(self, _sender=None):
@@ -233,8 +257,13 @@ class ScribeApp(rumps.App):
                 if stripped and stripped[-1].isalnum():
                     text = stripped + "."
                 logger.info("Transcript received (%d chars): %s", len(text), text[:80])
-                paste_text(text + " ")
-                logger.info("Paste completed")
+                try:
+                    paste_text(text + " ")
+                    logger.info("Paste completed")
+                except PasteError as pe:
+                    logger.error("Paste failed: %s", pe)
+                    self._overlay.show_error("Paste failed — check Accessibility permission")
+                    return
                 self._overlay.hide()
             else:
                 self._overlay.show_error("No speech detected")
@@ -255,6 +284,58 @@ class ScribeApp(rumps.App):
                 # Truncate long errors
                 short = error_msg[:60] + "\u2026" if len(error_msg) > 60 else error_msg
                 self._overlay.show_error(short)
+        finally:
+            self._transcribe_done = True
+            self._transcribing = False
+            self._reset_ui()
+
+    # --- Local mode internal ---
+
+    def _do_transcribe_local(self, audio_data: bytes):
+        try:
+            # Start elapsed-time updater
+            start_time = time.time()
+            self._transcribe_done = False
+
+            def _update_elapsed():
+                while not self._transcribe_done:
+                    elapsed = int(time.time() - start_time)
+                    if elapsed >= 3:
+                        self._overlay.update_status(f"Transcribing locally\u2026 {elapsed}s")
+                    time.sleep(1.0)
+
+            timer_thread = threading.Thread(target=_update_elapsed, daemon=True)
+            timer_thread.start()
+
+            text = transcribe_local(
+                audio_data,
+                language=self.config.get("language", ""),
+            )
+            self._transcribe_done = True
+
+            if text:
+                # Add trailing period if missing
+                stripped = text.rstrip()
+                if stripped and stripped[-1].isalnum():
+                    text = stripped + "."
+                logger.info("Local transcript (%d chars): %s", len(text), text[:80])
+                try:
+                    paste_text(text + " ")
+                    logger.info("Paste completed")
+                except PasteError as pe:
+                    logger.error("Paste failed: %s", pe)
+                    self._overlay.show_error("Paste failed \u2014 check Accessibility permission")
+                    return
+                self._overlay.hide()
+            else:
+                self._overlay.show_error("No speech detected")
+        except Exception as e:
+            self._transcribe_done = True
+            import traceback
+            error_msg = str(e)
+            logger.error("Local transcription failed: %s\n%s", e, traceback.format_exc())
+            short = error_msg[:60] + "\u2026" if len(error_msg) > 60 else error_msg
+            self._overlay.show_error(short)
         finally:
             self._transcribe_done = True
             self._transcribing = False
@@ -330,9 +411,17 @@ class ScribeApp(rumps.App):
             if full_text[-1].isalnum():
                 full_text += "."
             logger.info("Streaming final paste (%d chars): %s", len(full_text), full_text[:80])
-            paste_text(full_text + " ")
+            try:
+                paste_text(full_text + " ")
+            except PasteError as pe:
+                logger.error("Streaming paste failed: %s", pe)
+                self._overlay.show_error("Paste failed — check Accessibility permission")
+                self._reset_ui()
+                return
         else:
-            rumps.notification("Scriber", "Empty Transcript", "No speech was detected.")
+            self._overlay.show_error("No speech detected")
+            self._reset_ui()
+            return
 
         self._overlay.hide()
         self._reset_ui()
@@ -379,21 +468,19 @@ class ScribeApp(rumps.App):
         else:
             self.title = "\U0001f399"
 
-    # --- Mode toggle ---
+    # --- Mode selection ---
 
-    def _mode_label(self):
-        mode = self.config.get("mode", "batch")
-        if mode == "streaming":
-            return "Mode: Streaming (Scribe V2 RT)"
-        return "Mode: Batch (Scribe V2)"
-
-    def _toggle_mode(self, sender):
+    def _update_mode_checkmarks(self):
         current = self.config.get("mode", "batch")
-        new_mode = "batch" if current == "streaming" else "streaming"
+        for value, item in self._mode_items.items():
+            item.state = 1 if value == current else 0
+
+    def _select_mode(self, sender):
+        new_mode = getattr(sender, "_mode_value", "batch")
         self.config["mode"] = new_mode
         save_config(self.config)
-        self._mode_item.title = self._mode_label()
-        logger.info("Mode toggled to: %s", new_mode)
+        self._update_mode_checkmarks()
+        logger.info("Mode selected: %s", new_mode)
 
     # --- Settings ---
 
@@ -411,7 +498,7 @@ class ScribeApp(rumps.App):
         old_hotkey = self.config.get("hotkey")
         self.config = new_config
         save_config(self.config)
-        self._mode_item.title = self._mode_label()
+        self._update_mode_checkmarks()
         logger.info("Settings saved: mode=%s, hotkey=%s, device=%s",
                      new_config.get("mode"), new_config.get("hotkey"),
                      new_config.get("input_device", "default"))

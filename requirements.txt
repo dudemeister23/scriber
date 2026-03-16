@@ -6,3 +6,5 @@ pyobjc-framework-Quartz>=10.0
 pyobjc-framework-AVFoundation>=10.0
 numpy>=1.24.0
 websocket-client>=1.6.0
+mlx-audio>=0.4.1
+huggingface-hub>=0.20.0

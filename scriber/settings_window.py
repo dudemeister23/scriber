@@ -22,6 +22,7 @@ from AppKit import (
 from Foundation import NSMakeRect, NSMakeSize, NSObject
 
 from .audio import AudioRecorder
+from .local_transcribe import is_mlx_available, is_model_downloaded, download_model
 
 # Hotkey presets: (display label, config value)
 HOTKEY_PRESETS = [
@@ -35,10 +36,25 @@ HOTKEY_PRESETS = [
 MODE_PRESETS = [
     ("Batch \u2014 Scribe V2 (transcribe after recording)", "batch"),
     ("Streaming \u2014 Scribe V2 RT (real-time, as you speak)", "streaming"),
+    ("Local \u2014 Granite 4.0 (on-device, no API needed)", "local"),
 ]
 
 WINDOW_WIDTH = 420
-WINDOW_HEIGHT = 482
+WINDOW_HEIGHT = 520
+
+
+class _DownloadButtonTarget(NSObject):
+    """NSObject-based target for the Download Model button."""
+
+    def initWithController_(self, controller):
+        self = objc.super(_DownloadButtonTarget, self).init()
+        if self is None:
+            return None
+        self._controller = controller
+        return self
+
+    def downloadClicked_(self, sender):
+        self._controller._download_model_clicked_(sender)
 
 
 class _SaveButtonTarget(NSObject):
@@ -68,7 +84,9 @@ class SettingsWindowController:
         self._device_popup = None
         self._language_field = None
         self._keyterms_view = None
+        self._download_btn = None
         self._save_target = _SaveButtonTarget.alloc().initWithController_(self)
+        self._download_target = _DownloadButtonTarget.alloc().initWithController_(self)
         self._build_window()
 
     def _build_window(self):
@@ -127,7 +145,18 @@ class SettingsWindowController:
                 self._mode_popup.selectItemAtIndex_(i)
                 break
         content.addSubview_(self._mode_popup)
-        y -= 42
+        y -= 30
+
+        # --- Download Model button (for local mode) ---
+        self._download_btn = NSButton.alloc().initWithFrame_(
+            NSMakeRect(margin, y - 26, field_width, 26)
+        )
+        self._download_btn.setBezelStyle_(NSBezelStyleRounded)
+        self._download_btn.setTarget_(self._download_target)
+        self._download_btn.setAction_("downloadClicked:")
+        self._update_download_button()
+        content.addSubview_(self._download_btn)
+        y -= 36
 
         # --- Input Device ---
         y = self._add_label(content, "Input Device", margin, y, field_width, label_font, label_color)
@@ -275,6 +304,40 @@ class SettingsWindowController:
                 selected_idx = i + 1
         self._device_popup.selectItemAtIndex_(selected_idx)
 
+    def _update_download_button(self):
+        """Update the download button label based on model availability."""
+        if not is_mlx_available():
+            self._download_btn.setTitle_("Local model requires Apple Silicon + mlx-audio")
+            self._download_btn.setEnabled_(False)
+        elif is_model_downloaded():
+            self._download_btn.setTitle_("\u2713 Granite 4.0 Model Ready")
+            self._download_btn.setEnabled_(False)
+        else:
+            self._download_btn.setTitle_("Download Granite 4.0 Model (~2 GB)")
+            self._download_btn.setEnabled_(True)
+
+    def _download_model_clicked_(self, sender):
+        """Handle Download Model button click."""
+        self._download_btn.setTitle_("Downloading\u2026")
+        self._download_btn.setEnabled_(False)
+
+        def on_complete():
+            # Update button on main thread
+            self._download_btn.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "setTitle:", "\u2713 Granite 4.0 Model Ready", False
+            )
+
+        def on_error(msg):
+            self._download_btn.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "setTitle:", "Download failed — try again", False
+            )
+            self._download_btn.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "setEnabled:", True, False
+            )
+
+        download_model(on_complete=on_complete, on_error=on_error)
+
     def show(self):
+        self._update_download_button()
         NSApp.activateIgnoringOtherApps_(True)
         self._window.makeKeyAndOrderFront_(None)

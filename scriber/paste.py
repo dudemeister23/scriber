@@ -34,19 +34,29 @@ def _check_accessibility(prompt: bool = False) -> bool:
     return bool(trusted)
 
 
+class PasteError(Exception):
+    """Raised when paste fails due to permissions or other issues."""
+    pass
+
+
 def paste_text(text: str):
-    """Write text to pasteboard and simulate Cmd+V to paste it."""
+    """Write text to pasteboard and simulate Cmd+V to paste it.
+
+    Raises PasteError if Accessibility permission is missing or the paste
+    appears to have failed silently.
+    """
     # Check Accessibility permission; prompt user if missing
     if not _check_accessibility(prompt=True):
-        logger.error(
-            "Accessibility permission not granted. "
-            "Text has been placed on the clipboard -- use Cmd+V to paste manually."
-        )
+        logger.error("Accessibility permission not granted.")
         # Still put text on clipboard so the user can paste manually
         pb = NSPasteboard.generalPasteboard()
         pb.clearContents()
         pb.setString_forType_(text, NSPasteboardTypeString)
-        return
+        raise PasteError(
+            "Accessibility permission not granted. "
+            "Text is on clipboard — use Cmd+V to paste manually. "
+            "Re-grant in System Settings → Privacy & Security → Accessibility."
+        )
 
     # Save current pasteboard contents
     pb = NSPasteboard.generalPasteboard()
@@ -63,6 +73,12 @@ def paste_text(text: str):
     try:
         # Key down
         event_down = CGEventCreateKeyboardEvent(None, _kVK_V, True)
+        if event_down is None:
+            raise PasteError(
+                "Cannot create keyboard event — Accessibility permission may have been revoked. "
+                "Text is on clipboard — use Cmd+V to paste manually. "
+                "Re-grant in System Settings → Privacy & Security → Accessibility."
+            )
         CGEventSetFlags(event_down, kCGEventFlagMaskCommand)
         CGEventPost(kCGHIDEventTap, event_down)
 
@@ -72,8 +88,14 @@ def paste_text(text: str):
         CGEventPost(kCGHIDEventTap, event_up)
 
         logger.info("Paste keystroke sent via CGEvent")
+    except PasteError:
+        raise
     except Exception as e:
         logger.error("CGEvent paste failed: %s", e)
+        raise PasteError(
+            f"Paste keystroke failed: {e}. "
+            "Text is on clipboard — use Cmd+V to paste manually."
+        )
 
     # Wait for the target app to process the paste before restoring clipboard
     time.sleep(0.5)

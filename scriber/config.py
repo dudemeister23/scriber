@@ -14,7 +14,7 @@ DEFAULT_CONFIG = {
     "language": "",
     "keyterms": [],
     "input_device": "",
-    "mode": "batch",  # "batch" or "streaming"
+    "mode": "batch",  # "batch", "streaming", or "local"
 }
 
 
