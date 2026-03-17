@@ -1,7 +1,8 @@
 """Global hotkey using NSEvent global monitors.
 
-Uses NSEvent.addGlobalMonitorForEventsMatchingMask_ which does NOT require
-Accessibility permission (unlike CGEventTap). This is a passive monitor —
+Uses NSEvent.addGlobalMonitorForEventsMatchingMask_, which DOES require
+Accessibility permission on modern macOS when monitoring keyboard events
+(NSKeyDownMask, NSFlagsChangedMask). This is a passive monitor —
 it observes events without consuming them, which is fine for our use case.
 
 Supports two modes:

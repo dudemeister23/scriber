@@ -22,7 +22,10 @@ from AppKit import (
 from Foundation import NSMakeRect, NSMakeSize, NSObject
 
 from .audio import AudioRecorder
-from .local_transcribe import is_mlx_available, is_model_downloaded, download_model
+from .local_transcribe import (
+    is_mlx_available, is_model_downloaded, download_model,
+    get_model_status, MODELS as LOCAL_MODELS, DEFAULT_MODEL,
+)
 
 # Hotkey presets: (display label, config value)
 HOTKEY_PRESETS = [
@@ -36,11 +39,11 @@ HOTKEY_PRESETS = [
 MODE_PRESETS = [
     ("Batch \u2014 Scribe V2 (transcribe after recording)", "batch"),
     ("Streaming \u2014 Scribe V2 RT (real-time, as you speak)", "streaming"),
-    ("Local \u2014 Granite 4.0 (on-device, no API needed)", "local"),
+    ("Local \u2014 on-device (no API needed)", "local"),
 ]
 
 WINDOW_WIDTH = 420
-WINDOW_HEIGHT = 520
+WINDOW_HEIGHT = 700
 
 
 class _DownloadButtonTarget(NSObject):
@@ -51,10 +54,25 @@ class _DownloadButtonTarget(NSObject):
         if self is None:
             return None
         self._controller = controller
+        self._model_key = None
         return self
 
     def downloadClicked_(self, sender):
-        self._controller._download_model_clicked_(sender)
+        self._controller._download_model_clicked_(sender, self._model_key)
+
+
+class _LocalModelChangeTarget(NSObject):
+    """NSObject-based target for local model popup changes."""
+
+    def initWithController_(self, controller):
+        self = objc.super(_LocalModelChangeTarget, self).init()
+        if self is None:
+            return None
+        self._controller = controller
+        return self
+
+    def modelChanged_(self, sender):
+        self._controller._update_download_button()
 
 
 class _SaveButtonTarget(NSObject):
@@ -84,9 +102,11 @@ class SettingsWindowController:
         self._device_popup = None
         self._language_field = None
         self._keyterms_view = None
-        self._download_btn = None
+        self._download_btns = {}  # model_key -> NSButton
+        self._local_model_popup = None
         self._save_target = _SaveButtonTarget.alloc().initWithController_(self)
-        self._download_target = _DownloadButtonTarget.alloc().initWithController_(self)
+        self._download_targets = {}  # model_key -> _DownloadButtonTarget
+        self._local_model_change_target = _LocalModelChangeTarget.alloc().initWithController_(self)
         self._build_window()
 
     def _build_window(self):
@@ -147,16 +167,69 @@ class SettingsWindowController:
         content.addSubview_(self._mode_popup)
         y -= 30
 
-        # --- Download Model button (for local mode) ---
-        self._download_btn = NSButton.alloc().initWithFrame_(
-            NSMakeRect(margin, y - 26, field_width, 26)
+        # --- Local Model selector ---
+        y = self._add_label(content, "Local Model", margin, y, field_width, label_font, label_color)
+        self._local_model_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(margin, y - 26, field_width, 26), False
         )
-        self._download_btn.setBezelStyle_(NSBezelStyleRounded)
-        self._download_btn.setTarget_(self._download_target)
-        self._download_btn.setAction_("downloadClicked:")
-        self._update_download_button()
-        content.addSubview_(self._download_btn)
-        y -= 36
+        current_local_model = self._config.get("local_model", DEFAULT_MODEL)
+        self._local_model_keys = list(LOCAL_MODELS.keys())
+        for key in self._local_model_keys:
+            info = LOCAL_MODELS[key]
+            self._local_model_popup.addItemWithTitle_(f"{info['label']} ({info['size']})")
+        for i, key in enumerate(self._local_model_keys):
+            if key == current_local_model:
+                self._local_model_popup.selectItemAtIndex_(i)
+                break
+        self._local_model_popup.setTarget_(self._local_model_change_target)
+        self._local_model_popup.setAction_("modelChanged:")
+        content.addSubview_(self._local_model_popup)
+        y -= 32
+
+        # --- Fast Mode Checkbox ---
+        self._fast_mode_checkbox = NSButton.alloc().initWithFrame_(
+            NSMakeRect(margin, y - 24, field_width, 24)
+        )
+        self._fast_mode_checkbox.setButtonType_(3) # NSSwitchButton
+        self._fast_mode_checkbox.setTitle_("Fast Mode (Bypass precise grammar model for speed)")
+        self._fast_mode_checkbox.setState_(1 if self._config.get("local_fast_mode", False) else 0)
+        content.addSubview_(self._fast_mode_checkbox)
+        y -= 32
+
+        # --- Per-model download buttons ---
+        self._download_btns = {}
+        self._download_targets = {}
+        model_status = get_model_status()
+        for key in self._local_model_keys:
+            info = LOCAL_MODELS[key]
+            downloaded = model_status.get(key, False)
+
+            btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(margin, y - 24, field_width, 24)
+            )
+            btn.setBezelStyle_(NSBezelStyleRounded)
+            btn.setFont_(NSFont.systemFontOfSize_(11.0))
+
+            target = _DownloadButtonTarget.alloc().initWithController_(self)
+            target._model_key = key
+            btn.setTarget_(target)
+            btn.setAction_("downloadClicked:")
+
+            if not is_mlx_available():
+                btn.setTitle_(f"{info['label']} — requires Apple Silicon")
+                btn.setEnabled_(False)
+            elif downloaded:
+                btn.setTitle_(f"\u2713 {info['label']} — Ready")
+                btn.setEnabled_(False)
+            else:
+                btn.setTitle_(f"Download {info['label']} ({info['size']})")
+                btn.setEnabled_(True)
+
+            content.addSubview_(btn)
+            self._download_btns[key] = btn
+            self._download_targets[key] = target
+            y -= 26
+        y -= 6
 
         # --- Input Device ---
         y = self._add_label(content, "Input Device", margin, y, field_width, label_font, label_color)
@@ -253,6 +326,9 @@ class SettingsWindowController:
         mode_idx = self._mode_popup.indexOfSelectedItem()
         mode_value = MODE_PRESETS[mode_idx][1] if 0 <= mode_idx < len(MODE_PRESETS) else "batch"
 
+        local_model_value = self._get_selected_local_model_key()
+        local_fast_mode = bool(self._fast_mode_checkbox.state())
+
         language = str(self._language_field.stringValue()).strip()
 
         keyterms_text = str(self._keyterms_view.string())
@@ -262,6 +338,8 @@ class SettingsWindowController:
             "api_key": api_key,
             "hotkey": hotkey_value,
             "mode": mode_value,
+            "local_model": local_model_value,
+            "local_fast_mode": local_fast_mode,
             "input_device": input_device,
             "language": language,
             "keyterms": keyterms,
@@ -292,6 +370,16 @@ class SettingsWindowController:
                 self._mode_popup.selectItemAtIndex_(i)
                 break
 
+        # Update local model selection
+        current_local_model = config.get("local_model", DEFAULT_MODEL)
+        for i, key in enumerate(self._local_model_keys):
+            if key == current_local_model:
+                self._local_model_popup.selectItemAtIndex_(i)
+                break
+
+        # Update fast mode
+        self._fast_mode_checkbox.setState_(1 if config.get("local_fast_mode", False) else 0)
+
         # Update device list and selection
         self._device_popup.removeAllItems()
         self._device_popup.addItemWithTitle_("System Default")
@@ -304,38 +392,62 @@ class SettingsWindowController:
                 selected_idx = i + 1
         self._device_popup.selectItemAtIndex_(selected_idx)
 
-    def _update_download_button(self):
-        """Update the download button label based on model availability."""
-        if not is_mlx_available():
-            self._download_btn.setTitle_("Local model requires Apple Silicon + mlx-audio")
-            self._download_btn.setEnabled_(False)
-        elif is_model_downloaded():
-            self._download_btn.setTitle_("\u2713 Granite 4.0 Model Ready")
-            self._download_btn.setEnabled_(False)
-        else:
-            self._download_btn.setTitle_("Download Granite 4.0 Model (~2 GB)")
-            self._download_btn.setEnabled_(True)
+    def _get_selected_local_model_key(self):
+        """Get the currently selected local model key."""
+        if self._local_model_popup is None:
+            return self._config.get("local_model", DEFAULT_MODEL)
+        idx = self._local_model_popup.indexOfSelectedItem()
+        if 0 <= idx < len(self._local_model_keys):
+            return self._local_model_keys[idx]
+        return DEFAULT_MODEL
 
-    def _download_model_clicked_(self, sender):
+    def _update_download_button(self):
+        """Update all download buttons based on model availability."""
+        model_status = get_model_status()
+        for key, btn in self._download_btns.items():
+            info = LOCAL_MODELS.get(key, LOCAL_MODELS[DEFAULT_MODEL])
+            if not is_mlx_available():
+                btn.setTitle_(f"{info['label']} \u2014 requires Apple Silicon")
+                btn.setEnabled_(False)
+            elif model_status.get(key, False):
+                btn.setTitle_(f"\u2713 {info['label']} \u2014 Ready")
+                btn.setEnabled_(False)
+            else:
+                btn.setTitle_(f"Download {info['label']} ({info['size']})")
+                btn.setEnabled_(True)
+
+    def _download_model_clicked_(self, sender, model_key=None):
         """Handle Download Model button click."""
-        self._download_btn.setTitle_("Downloading\u2026")
-        self._download_btn.setEnabled_(False)
+        if model_key is None:
+            model_key = self._get_selected_local_model_key()
+        model_info = LOCAL_MODELS.get(model_key, LOCAL_MODELS[DEFAULT_MODEL])
+        btn = self._download_btns.get(model_key)
+        if btn:
+            btn.setTitle_("Downloading\u2026")
+            btn.setEnabled_(False)
+
+        def on_progress(msg):
+            if btn:
+                btn.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "setTitle:", msg, False
+                )
 
         def on_complete():
-            # Update button on main thread
-            self._download_btn.performSelectorOnMainThread_withObject_waitUntilDone_(
-                "setTitle:", "\u2713 Granite 4.0 Model Ready", False
-            )
+            if btn:
+                btn.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "setTitle:", f"\u2713 {model_info['label']} \u2014 Ready", False
+                )
 
         def on_error(msg):
-            self._download_btn.performSelectorOnMainThread_withObject_waitUntilDone_(
-                "setTitle:", "Download failed — try again", False
-            )
-            self._download_btn.performSelectorOnMainThread_withObject_waitUntilDone_(
-                "setEnabled:", True, False
-            )
+            if btn:
+                btn.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "setTitle:", "Download failed \u2014 try again", False
+                )
+                btn.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "setEnabled:", True, False
+                )
 
-        download_model(on_complete=on_complete, on_error=on_error)
+        download_model(model_key=model_key, on_progress=on_progress, on_complete=on_complete, on_error=on_error)
 
     def show(self):
         self._update_download_button()

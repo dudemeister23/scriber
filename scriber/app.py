@@ -20,7 +20,7 @@ from .config import CONFIG_FILE, load_config, save_config, get_api_key
 from .overlay import RecordingOverlay
 from .paste import paste_text, PasteError, _check_accessibility
 from .settings_window import SettingsWindowController
-from .local_transcribe import is_model_downloaded, transcribe_local
+from .local_transcribe import is_model_downloaded, transcribe_local, MODELS as LOCAL_MODELS, DEFAULT_MODEL as LOCAL_DEFAULT_MODEL
 from .streaming import StreamingTranscriber
 from .transcribe import transcribe
 
@@ -69,7 +69,7 @@ class ScribeApp(rumps.App):
         for label, value in [
             ("Batch (Scribe V2)", "batch"),
             ("Streaming (Scribe V2 RT)", "streaming"),
-            ("Local (Granite 4.0)", "local"),
+            ("Local (on-device)", "local"),
         ]:
             item = rumps.MenuItem(label, callback=self._select_mode)
             item._mode_value = value
@@ -162,10 +162,12 @@ class ScribeApp(rumps.App):
         if mode == "streaming":
             self._start_streaming()
         elif mode == "local":
-            if not is_model_downloaded():
+            local_model_key = self.config.get("local_model", LOCAL_DEFAULT_MODEL)
+            if not is_model_downloaded(local_model_key):
                 self.recorder.stop()
                 self._overlay.show("Recording\u2026")
-                self._overlay.show_error("Model not downloaded \u2014 open Settings")
+                model_label = LOCAL_MODELS.get(local_model_key, {}).get("label", local_model_key)
+                self._overlay.show_error(f"{model_label} not downloaded \u2014 open Settings")
                 self._reset_ui()
                 return
             self._overlay.show("Recording\u2026")
@@ -307,9 +309,14 @@ class ScribeApp(rumps.App):
             timer_thread = threading.Thread(target=_update_elapsed, daemon=True)
             timer_thread.start()
 
+            local_model_key = self.config.get("local_model", LOCAL_DEFAULT_MODEL)
+            fast_mode = self.config.get("local_fast_mode", False)
             text = transcribe_local(
                 audio_data,
                 language=self.config.get("language", ""),
+                model_key=local_model_key,
+                fast_mode=fast_mode,
+                keyterms=self.config.get("keyterms", []),
             )
             self._transcribe_done = True
 

@@ -1,5 +1,10 @@
 """py2app build configuration for Scriber."""
 
+import sys
+# py2app's AST scanner can hit the default recursion limit when scanning
+# large dependency trees (e.g. mlx_lm, transformers).
+sys.setrecursionlimit(5000)
+
 import atexit
 import compileall
 import importlib.util
@@ -35,11 +40,9 @@ def _post_build_copy_mlx_assets():
     lib_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(_mlx_metallib, lib_dir / "mlx.metallib")
     shutil.copy2(_libmlx, lib_dir / "libmlx.dylib")
-    # Also place metallib in Frameworks/ — dyld may load libmlx.dylib from
-    # there instead, and MLX resolves metallib relative to the loaded dylib.
-    frameworks_dir = Path("dist/Scriber.app/Contents/Frameworks")
-    if frameworks_dir.exists():
-        shutil.copy2(_mlx_metallib, frameworks_dir / "mlx.metallib")
+    # Note: metallib is NOT copied to Frameworks/ — it causes codesign
+    # --deep --strict failures since it's not a Mach-O binary. MLX finds
+    # it via the lib-dynload/mlx/lib/ path through core.so's rpath.
 
     # Inject missing mlx Python modules into python313.zip.
     # py2app puts mlx/__init__.pyc and mlx/core.pyc in the zip but
@@ -85,7 +88,7 @@ OPTIONS = {
         "NSMicrophoneUsageDescription": "Scriber needs microphone access to record audio for transcription.",
         "NSAppleEventsUsageDescription": "Scriber needs accessibility access to paste transcribed text.",
     },
-    "packages": ["scriber", "_sounddevice_data", "charset_normalizer", "numpy", "certifi"],
+    "packages": ["scriber", "_sounddevice_data", "charset_normalizer", "numpy", "certifi", "mlx_audio", "mlx_lm"],
     "includes": [
         "rumps",
         "sounddevice",
@@ -97,7 +100,12 @@ OPTIONS = {
         "ApplicationServices",
         "websocket",
         "huggingface_hub",
-        "mlx_audio",
+    ],
+    "excludes": [
+        "torch",
+        "torchvision",
+        "torchaudio",
+        "deepmultilingualpunctuation",
     ],
     "frameworks": [
         _portaudio,
