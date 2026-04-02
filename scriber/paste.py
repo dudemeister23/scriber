@@ -39,8 +39,49 @@ class PasteError(Exception):
     pass
 
 
+def _save_pasteboard():
+    """Save all pasteboard items with all their types (string, image, file, etc.)."""
+    pb = NSPasteboard.generalPasteboard()
+    items = pb.pasteboardItems()
+    if not items:
+        return None
+
+    saved = []
+    for item in items:
+        item_data = {}
+        for t in item.types():
+            data = item.dataForType_(t)
+            if data:
+                item_data[t] = data
+        if item_data:
+            saved.append(item_data)
+    return saved or None
+
+
+def _restore_pasteboard(saved):
+    """Restore pasteboard from previously saved items."""
+    pb = NSPasteboard.generalPasteboard()
+    if not saved:
+        pb.clearContents()
+        return
+
+    from AppKit import NSPasteboardItem
+    new_items = []
+    for item_data in saved:
+        item = NSPasteboardItem.alloc().init()
+        for type_name, data in item_data.items():
+            item.setData_forType_(data, type_name)
+        new_items.append(item)
+
+    pb.clearContents()
+    pb.writeObjects_(new_items)
+
+
 def paste_text(text: str):
     """Write text to pasteboard and simulate Cmd+V to paste it.
+
+    Saves the full pasteboard state (all types) before pasting and restores
+    it afterwards, so the user's clipboard is not disrupted.
 
     Raises PasteError if Accessibility permission is missing or the paste
     appears to have failed silently.
@@ -58,20 +99,19 @@ def paste_text(text: str):
             "Re-grant in System Settings → Privacy & Security → Accessibility."
         )
 
-    # Save current pasteboard contents
-    pb = NSPasteboard.generalPasteboard()
-    old_contents = pb.stringForType_(NSPasteboardTypeString)
+    # Save full pasteboard state (all types: string, image, file, etc.)
+    saved = _save_pasteboard()
 
-    # Set new text
-    pb.clearContents()
-    pb.setString_forType_(text, NSPasteboardTypeString)
-
-    # Small delay to ensure pasteboard is ready
-    time.sleep(0.05)
-
-    # Simulate Cmd+V via CGEvent (requires Accessibility permission)
     try:
-        # Key down
+        # Set new text
+        pb = NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        pb.setString_forType_(text, NSPasteboardTypeString)
+
+        # Small delay to ensure pasteboard is ready
+        time.sleep(0.05)
+
+        # Simulate Cmd+V via CGEvent (requires Accessibility permission)
         event_down = CGEventCreateKeyboardEvent(None, _kVK_V, True)
         if event_down is None:
             raise PasteError(
@@ -82,73 +122,15 @@ def paste_text(text: str):
         CGEventSetFlags(event_down, kCGEventFlagMaskCommand)
         CGEventPost(kCGHIDEventTap, event_down)
 
-        # Key up
         event_up = CGEventCreateKeyboardEvent(None, _kVK_V, False)
         CGEventSetFlags(event_up, kCGEventFlagMaskCommand)
         CGEventPost(kCGHIDEventTap, event_up)
 
         logger.info("Paste keystroke sent via CGEvent")
-    except PasteError:
-        raise
-    except Exception as e:
-        logger.error("CGEvent paste failed: %s", e)
-        raise PasteError(
-            f"Paste keystroke failed: {e}. "
-            "Text is on clipboard — use Cmd+V to paste manually."
-        )
 
-    # Wait for the target app to process the paste before restoring clipboard
-    time.sleep(0.5)
-    if old_contents is not None:
-        pb.clearContents()
-        pb.setString_forType_(old_contents, NSPasteboardTypeString)
+        # Wait for the target app to process the paste before restoring clipboard
+        time.sleep(0.5)
+    finally:
+        _restore_pasteboard(saved)
 
     logger.info("Paste completed")
-
-
-# --- Streaming helpers ---
-
-def save_clipboard():
-    """Save current clipboard contents. Call before a streaming session."""
-    pb = NSPasteboard.generalPasteboard()
-    return pb.stringForType_(NSPasteboardTypeString)
-
-
-def restore_clipboard(old_contents):
-    """Restore clipboard contents. Call after a streaming session."""
-    if old_contents is not None:
-        pb = NSPasteboard.generalPasteboard()
-        pb.clearContents()
-        pb.setString_forType_(old_contents, NSPasteboardTypeString)
-
-
-def _send_cmd_v():
-    """Simulate Cmd+V keystroke via CGEvent."""
-    event_down = CGEventCreateKeyboardEvent(None, _kVK_V, True)
-    CGEventSetFlags(event_down, kCGEventFlagMaskCommand)
-    CGEventPost(kCGHIDEventTap, event_down)
-
-    event_up = CGEventCreateKeyboardEvent(None, _kVK_V, False)
-    CGEventSetFlags(event_up, kCGEventFlagMaskCommand)
-    CGEventPost(kCGHIDEventTap, event_up)
-
-
-def paste_text_streaming(text: str):
-    """Paste text during a streaming session (no clipboard save/restore).
-
-    Faster than paste_text — skips save/restore since the caller manages
-    the clipboard lifecycle via save_clipboard/restore_clipboard.
-    """
-    pb = NSPasteboard.generalPasteboard()
-    pb.clearContents()
-    pb.setString_forType_(text, NSPasteboardTypeString)
-
-    time.sleep(0.03)
-
-    try:
-        _send_cmd_v()
-    except Exception as e:
-        logger.error("Streaming paste failed: %s", e)
-
-    # Short delay for target app to process
-    time.sleep(0.1)
