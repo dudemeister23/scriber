@@ -60,6 +60,9 @@ class ScribeApp(rumps.App):
         # Streaming state
         self._streaming_session = None
 
+        # Last transcription (for re-pasting)
+        self._last_transcription = None
+
         # Build menu
         self.status_item = rumps.MenuItem("Ready")
         self.status_item.set_callback(None)
@@ -77,8 +80,15 @@ class ScribeApp(rumps.App):
             self._mode_menu.add(item)
         self._update_mode_checkmarks()
 
+        self._paste_last_item = rumps.MenuItem(
+            "Paste Last Transcription", callback=self._paste_last_transcription
+        )
+        self._paste_last_item.set_callback(None)  # disabled until first transcription
+
         self.menu = [
             self.status_item,
+            None,
+            self._paste_last_item,
             None,
             self._mode_menu,
             rumps.MenuItem("Settings\u2026", callback=self._open_settings),
@@ -259,6 +269,7 @@ class ScribeApp(rumps.App):
                 if stripped and stripped[-1].isalnum():
                     text = stripped + "."
                 logger.info("Transcript received (%d chars): %s", len(text), text[:80])
+                self._save_last_transcription(text)
                 try:
                     paste_text(text + " ")
                     logger.info("Paste completed")
@@ -326,6 +337,7 @@ class ScribeApp(rumps.App):
                 if stripped and stripped[-1].isalnum():
                     text = stripped + "."
                 logger.info("Local transcript (%d chars): %s", len(text), text[:80])
+                self._save_last_transcription(text)
                 try:
                     paste_text(text + " ")
                     logger.info("Paste completed")
@@ -418,6 +430,7 @@ class ScribeApp(rumps.App):
             if full_text[-1].isalnum():
                 full_text += "."
             logger.info("Streaming final paste (%d chars): %s", len(full_text), full_text[:80])
+            self._save_last_transcription(full_text)
             try:
                 paste_text(full_text + " ")
             except PasteError as pe:
@@ -465,6 +478,25 @@ class ScribeApp(rumps.App):
         logger.error("Streaming error: %s", error_msg)
         short = error_msg[:60] + "\u2026" if len(error_msg) > 60 else error_msg
         self._overlay.show_error(short)
+
+    # --- Last transcription ---
+
+    def _save_last_transcription(self, text: str):
+        """Store the transcription so it can be re-pasted from the menu."""
+        self._last_transcription = text
+        # Enable the menu item
+        self._paste_last_item.set_callback(self._paste_last_transcription)
+
+    def _paste_last_transcription(self, _sender=None):
+        """Re-paste the most recent transcription."""
+        if not self._last_transcription:
+            return
+        try:
+            paste_text(self._last_transcription + " ")
+            logger.info("Re-pasted last transcription (%d chars)", len(self._last_transcription))
+        except PasteError as pe:
+            logger.error("Re-paste failed: %s", pe)
+            rumps.notification("Scriber", "Paste Failed", "Check Accessibility permission.")
 
     # --- UI ---
 
