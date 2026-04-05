@@ -48,6 +48,23 @@ def transcribe(
 
     _log_response(response)
 
+    # Surface the specific failure reason when the API returns 401. A 401
+    # can mean "wrong key" OR "out of credits" (quota_exceeded) — the two
+    # call for very different user actions.
+    if response.status_code == 401:
+        try:
+            body = response.json()
+            detail = body.get("detail")
+            if isinstance(detail, dict):
+                status = detail.get("status", "")
+                message = detail.get("message", "")
+                if status == "quota_exceeded":
+                    raise RuntimeError(
+                        f"ElevenLabs quota exceeded: {message}"
+                    )
+        except (ValueError, KeyError):
+            pass
+
     response.raise_for_status()
     result = response.json()
     return result.get("text", "")

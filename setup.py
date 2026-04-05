@@ -73,6 +73,7 @@ DATA_FILES = [
     ("icons", [
         "scriber/icons/mic_idle.png",
         "scriber/icons/mic_recording.png",
+        "scriber/icons/mic_meeting.png",
     ]),
 ]
 OPTIONS = {
@@ -106,6 +107,18 @@ OPTIONS = {
         "torchvision",
         "torchaudio",
         "deepmultilingualpunctuation",
+        # File-transcription deps are not bundled (torch alone is ~1.5 GB).
+        # The feature only works when running from source with
+        # requirements-file-transcribe.txt installed.
+        "pyannote",
+        "pyannote.audio",
+        "pytorch_lightning",
+        "lightning",
+        "lightning_fabric",
+        "torchmetrics",
+        "pytorch_metric_learning",
+        "speechbrain",
+        "asteroid_filterbanks",
     ],
     "frameworks": [
         _portaudio,

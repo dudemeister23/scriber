@@ -9,13 +9,14 @@ import webbrowser
 
 import objc
 import rumps
+from AppKit import NSApplication, NSMenu, NSMenuItem
 from AVFoundation import (
     AVCaptureDevice,
     AVMediaTypeAudio,
     AVAuthorizationStatusAuthorized,
     AVAuthorizationStatusNotDetermined,
 )
-from Foundation import NSObject
+from Foundation import NSObject, NSRunLoop, NSRunLoopCommonModes, NSTimer
 
 from . import __version__
 from .audio import AudioRecorder
@@ -24,11 +25,62 @@ from .overlay import RecordingOverlay
 from .paste import paste_text, PasteError, _check_accessibility
 from .settings_window import SettingsWindowController
 from .local_transcribe import is_model_downloaded, transcribe_local, MODELS as LOCAL_MODELS, DEFAULT_MODEL as LOCAL_DEFAULT_MODEL
+from .file_transcribe_window import FileTranscribeWindowController
+from .meeting_recorder import MeetingRecorder, DEFAULT_MEETINGS_DIR
 from .streaming import StreamingTranscriber
+from .system_audio import SystemAudioUnavailable, is_supported as system_audio_supported
 from .transcribe import transcribe
 from . import updater
 
 logger = logging.getLogger("scriber")
+
+
+def _install_edit_menu():
+    """Attach a standard Edit menu so Cmd+C/V/X/A work in text fields.
+
+    LSUIElement (menubar-only) apps get no default menu bar, which means
+    keyboard shortcuts like Cmd+V are never routed through the first-responder
+    chain to focused text fields. Adding an Edit menu with the standard
+    cut:/copy:/paste:/selectAll: actions fixes that — the menu itself isn't
+    displayed (we're still menubar-only), but the keyboard equivalents are
+    picked up by NSApp.
+    """
+    app = NSApplication.sharedApplication()
+    main = app.mainMenu()
+    if main is None:
+        main = NSMenu.alloc().init()
+        app.setMainMenu_(main)
+
+    # Skip if we've already added it
+    for i in range(main.numberOfItems()):
+        item = main.itemAtIndex_(i)
+        if item.title() == "Edit":
+            return
+
+    edit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Edit", None, ""
+    )
+    edit_menu = NSMenu.alloc().initWithTitle_("Edit")
+    for title, selector, key in (
+        ("Undo", "undo:", "z"),
+        ("Redo", "redo:", "Z"),
+        (None, None, None),  # separator
+        ("Cut", "cut:", "x"),
+        ("Copy", "copy:", "c"),
+        ("Paste", "paste:", "v"),
+        ("Delete", "delete:", ""),
+        ("Select All", "selectAll:", "a"),
+    ):
+        if title is None:
+            edit_menu.addItem_(NSMenuItem.separatorItem())
+            continue
+        mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            title, selector, key
+        )
+        edit_menu.addItem_(mi)
+
+    edit_item.setSubmenu_(edit_menu)
+    main.addItem_(edit_item)
 
 
 def _resource_path(filename: str) -> str:
@@ -43,6 +95,29 @@ def _resource_path(filename: str) -> str:
 
 ICON_IDLE = _resource_path("mic_idle.png")
 ICON_RECORDING = _resource_path("mic_recording.png")
+ICON_MEETING = _resource_path("mic_meeting.png")
+
+
+class _TimerTarget(NSObject):
+    """NSTimer target that calls a Python callable on each tick.
+
+    Used instead of rumps.Timer when we need the callback to fire during
+    NSMenu tracking — rumps.Timer schedules in NSDefaultRunLoopMode only,
+    so its callback pauses while the menu is open.
+    """
+
+    def initWithCallback_(self, callback):
+        self = objc.super(_TimerTarget, self).init()
+        if self is None:
+            return None
+        self._callback = callback
+        return self
+
+    def tick_(self, _timer):
+        try:
+            self._callback()
+        except Exception as e:
+            logger.error("Timer tick failed: %s", e)
 
 
 class _MainThreadDispatcher(NSObject):
@@ -85,17 +160,26 @@ class ScribeApp(rumps.App):
             template=True,
             quit_button=None,
         )
+        # Install a standard Edit menu so Cmd+C/V/X/A work in text fields
+        # (LSUIElement apps don't get this for free).
+        _install_edit_menu()
         self.config = load_config()
         self.recorder = AudioRecorder()
         self._transcribing = False
         self._overlay = RecordingOverlay(self.recorder)
         self._settings_controller = None
+        self._file_transcribe_controller = None
 
         # Streaming state
         self._streaming_session = None
 
         # Last transcription (for re-pasting)
         self._last_transcription = None
+
+        # Meeting recording state
+        self._meeting_recorder = None
+        self._meeting_timer = None
+        self._meeting_timer_target = None
 
         # Build menu
         self.status_item = rumps.MenuItem("Ready")
@@ -119,10 +203,24 @@ class ScribeApp(rumps.App):
         )
         self._paste_last_item.set_callback(None)  # disabled until first transcription
 
+        self._meeting_item = rumps.MenuItem(
+            "Start Meeting Recording", callback=self._toggle_meeting_recording
+        )
+        if not system_audio_supported():
+            self._meeting_item.set_callback(None)
+            self._meeting_item.title = "Meeting Recording (needs macOS 14.4+)"
+
+        self._open_meetings_item = rumps.MenuItem(
+            "Open Meetings Folder", callback=self._open_meetings_folder
+        )
+
         self.menu = [
             self.status_item,
             None,
             self._paste_last_item,
+            self._meeting_item,
+            self._open_meetings_item,
+            rumps.MenuItem("Transcribe File\u2026", callback=self._open_file_transcribe),
             None,
             self._mode_menu,
             rumps.MenuItem("Settings\u2026", callback=self._open_settings),
@@ -183,6 +281,12 @@ class ScribeApp(rumps.App):
         )
         return False
 
+    def _base_icon(self) -> str:
+        """Icon to show when not actively dictating. Respects meeting state."""
+        if self._meeting_recorder is not None and os.path.exists(ICON_MEETING):
+            return ICON_MEETING
+        return ICON_IDLE
+
     def start_recording(self, _sender=None):
         """Called when the hotkey is pressed (hold) or toggled on."""
         logger.info("start_recording called (transcribing=%s, recording=%s)",
@@ -205,7 +309,11 @@ class ScribeApp(rumps.App):
             return
 
         self.status_item.title = "Recording\u2026"
-        if os.path.exists(ICON_RECORDING):
+        # During a meeting recording, keep the subtle meeting icon instead of
+        # flashing the red dictation icon — the orange mic dot is already on.
+        if self._meeting_recorder is not None:
+            self.icon = self._base_icon()
+        elif os.path.exists(ICON_RECORDING):
             self.icon = ICON_RECORDING
         else:
             self.title = "\U0001f534"
@@ -244,8 +352,9 @@ class ScribeApp(rumps.App):
 
         audio_data = self.recorder.stop()
 
-        if os.path.exists(ICON_IDLE):
-            self.icon = ICON_IDLE
+        base = self._base_icon()
+        if os.path.exists(base):
+            self.icon = base
         else:
             self.title = "\u231b"
 
@@ -328,7 +437,9 @@ class ScribeApp(rumps.App):
             error_msg = str(e)
             logger.error("Transcription failed: %s", e)
             # Show a user-friendly error in the overlay
-            if "500" in error_msg:
+            if "quota" in error_msg.lower():
+                self._overlay.show_error("ElevenLabs quota exceeded — switch to Local mode")
+            elif "500" in error_msg:
                 self._overlay.show_error("API server error — try again")
             elif "401" in error_msg or "403" in error_msg:
                 self._overlay.show_error("Invalid API key")
@@ -522,6 +633,133 @@ class ScribeApp(rumps.App):
         short = error_msg[:60] + "\u2026" if len(error_msg) > 60 else error_msg
         self._overlay.show_error(short)
 
+    # --- Meeting recording ---
+
+    def _toggle_meeting_recording(self, _sender=None):
+        if self._meeting_recorder is None:
+            self._start_meeting_recording()
+        else:
+            self._stop_meeting_recording()
+
+    def _start_meeting_recording(self):
+        if self._meeting_recorder is not None:
+            return
+        # Don't compete with hotkey-driven dictation
+        if self.recorder.is_recording or self._transcribing:
+            rumps.notification(
+                "Scriber",
+                "Recording in progress",
+                "Finish the current dictation before starting a meeting recording.",
+            )
+            return
+        if not self._check_mic_permission():
+            return
+
+        device_name = self.config.get("input_device", "")
+        device_index = AudioRecorder.resolve_device_name(device_name)
+        meetings_dir = self.config.get("meetings_dir", "") or ""
+
+        try:
+            recorder = MeetingRecorder(meetings_dir=meetings_dir, mic_device=device_index)
+            path = recorder.start()
+        except SystemAudioUnavailable as e:
+            logger.error("System audio capture unavailable: %s", e)
+            rumps.alert(
+                title="Meeting Recording Unavailable",
+                message=str(e),
+            )
+            return
+        except Exception as e:
+            logger.error("Failed to start meeting recording: %s", e)
+            rumps.alert(
+                title="Could Not Start Meeting Recording",
+                message=str(e),
+            )
+            return
+
+        self._meeting_recorder = recorder
+        logger.info("Meeting recording started -> %s", path)
+
+        if os.path.exists(ICON_MEETING):
+            self.icon = ICON_MEETING
+        self._meeting_item.title = "Stop Meeting Recording (00:00)"
+
+        # Tick the elapsed counter. We use an NSTimer in NSRunLoopCommonModes
+        # (rather than rumps.Timer which only runs in the default run-loop
+        # mode) so the menu item's title keeps updating live while the menu
+        # is open — otherwise the mm:ss freezes the moment you click.
+        self._meeting_timer_target = _TimerTarget.alloc().initWithCallback_(
+            self._update_meeting_elapsed
+        )
+        self._meeting_timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.0, self._meeting_timer_target, "tick:", None, True
+        )
+        NSRunLoop.currentRunLoop().addTimer_forMode_(
+            self._meeting_timer, NSRunLoopCommonModes
+        )
+
+    def _update_meeting_elapsed(self):
+        if self._meeting_recorder is None:
+            return
+        secs = int(self._meeting_recorder.elapsed_seconds)
+        m, s = divmod(secs, 60)
+        h, m = divmod(m, 60)
+        if h > 0:
+            elapsed = f"{h:d}:{m:02d}:{s:02d}"
+        else:
+            elapsed = f"{m:02d}:{s:02d}"
+        self._meeting_item.title = f"Stop Meeting Recording ({elapsed})"
+
+    def _stop_meeting_recording(self):
+        recorder = self._meeting_recorder
+        if recorder is None:
+            return
+
+        if self._meeting_timer is not None:
+            try:
+                self._meeting_timer.invalidate()
+            except Exception:
+                pass
+            self._meeting_timer = None
+            self._meeting_timer_target = None
+
+        self._meeting_item.title = "Stopping\u2026"
+        try:
+            path = recorder.stop()
+        except Exception as e:
+            logger.error("Meeting stop failed: %s", e)
+            path = recorder.file_path
+
+        self._meeting_recorder = None
+        self._meeting_item.title = "Start Meeting Recording"
+
+        if os.path.exists(ICON_IDLE):
+            self.icon = ICON_IDLE
+
+        # Drop the user into the file-transcription window with this file
+        # pre-selected so they can kick off diarized transcription.
+        if path and os.path.isfile(path):
+            self._open_file_transcribe_with(path)
+        else:
+            rumps.notification("Scriber", "Meeting Recording Saved", path or "")
+
+    def _open_file_transcribe_with(self, path: str):
+        """Open the file-transcription window and pre-load `path`."""
+        self._open_file_transcribe(None)
+        if self._file_transcribe_controller is not None:
+            self._file_transcribe_controller.load_file(path)
+
+    def _open_meetings_folder(self, _sender=None):
+        """Reveal the meetings directory in Finder, creating it if needed."""
+        configured = self.config.get("meetings_dir", "") or ""
+        path = os.path.expanduser(configured) if configured else DEFAULT_MEETINGS_DIR
+        try:
+            os.makedirs(path, exist_ok=True)
+            subprocess.Popen(["open", path])
+        except Exception as e:
+            logger.error("Could not open meetings folder %s: %s", path, e)
+            rumps.notification("Scriber", "Could not open folder", str(e))
+
     # --- Last transcription ---
 
     def _save_last_transcription(self, text: str):
@@ -544,9 +782,16 @@ class ScribeApp(rumps.App):
     # --- UI ---
 
     def _reset_ui(self):
-        self.status_item.title = "Ready"
-        if os.path.exists(ICON_IDLE):
-            self.icon = ICON_IDLE
+        # "Ready" status label also doubles as the meeting-recording indicator
+        # when the meeting recorder is active — otherwise a user finishing
+        # dictation mid-meeting would see "Ready" and wonder if recording stopped.
+        if self._meeting_recorder is not None:
+            self.status_item.title = "Meeting recording\u2026"
+        else:
+            self.status_item.title = "Ready"
+        base = self._base_icon()
+        if os.path.exists(base):
+            self.icon = base
         else:
             self.title = "\U0001f399"
 
@@ -575,6 +820,21 @@ class ScribeApp(rumps.App):
         else:
             self._settings_controller.update_config(self.config)
         self._settings_controller.show()
+
+    def _open_file_transcribe(self, sender):
+        if self._file_transcribe_controller is None:
+            self._file_transcribe_controller = FileTranscribeWindowController(
+                config=self.config,
+                save_config_callback=self._apply_file_transcribe_config,
+            )
+        else:
+            self._file_transcribe_controller.update_config(self.config)
+        self._file_transcribe_controller.show()
+
+    def _apply_file_transcribe_config(self, new_config: dict):
+        """Persist changes made from the file-transcription window."""
+        self.config = new_config
+        save_config(self.config)
 
     def _apply_settings(self, new_config: dict):
         old_hotkey = self.config.get("hotkey")
@@ -767,6 +1027,17 @@ class ScribeApp(rumps.App):
         self._main_dispatcher.enqueue_(action)
 
     def quit_app(self, sender=None):
+        if self._meeting_recorder is not None:
+            try:
+                if self._meeting_timer is not None:
+                    self._meeting_timer.invalidate()
+                    self._meeting_timer = None
+                    self._meeting_timer_target = None
+                path = self._meeting_recorder.stop()
+                logger.info("Meeting recording finalized on quit: %s", path)
+            except Exception as e:
+                logger.warning("Meeting recorder quit-stop error: %s", e)
+            self._meeting_recorder = None
         if self._streaming_session:
             self.recorder.set_on_chunk(None)
             self._streaming_session.stop()

@@ -1,0 +1,18 @@
+# Heavy dependencies for the offline file-transcription feature
+# (diarization + ASR on a user-provided audio/video file).
+#
+# These are NOT installed by build.sh or by the default requirements.txt
+# because torch alone adds ~1.5 GB. Install them explicitly when you want
+# the file-transcription feature:
+#
+#   source .venv/bin/activate
+#   pip install -r requirements-file-transcribe.txt
+#
+# You will also need ffmpeg:  brew install ffmpeg
+
+# - pyannote.audio 4.x uses the modern huggingface_hub API and doesn't need
+#   the now-removed torchaudio.AudioMetaData.
+# - pyannote.audio 4.x requires torch>=2.8.
+pyannote.audio>=4.0.0,<5.0.0
+torch>=2.8.0
+torchaudio>=2.8.0

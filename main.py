@@ -8,6 +8,11 @@ import warnings
 warnings.filterwarnings("ignore", message=".*character detection.*")
 
 from scriber.config import CONFIG_DIR, ensure_config_dir
+from scriber.deps_manager import inject_deps_path
+
+# Make externally-installed file-transcription deps (pyannote/torch) visible
+# BEFORE we import anything that might lazy-touch them.
+inject_deps_path()
 
 # Set up file + console logging before importing anything else
 ensure_config_dir()

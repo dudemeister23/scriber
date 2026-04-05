@@ -18,6 +18,9 @@ DEFAULT_CONFIG = {
     "local_fast_mode": False,  # If True, skips Qwen punctuation model
     "last_update_check": 0,  # Unix timestamp of last update check
     "skipped_update_version": "",  # Version the user clicked "Later" on
+    "hf_token": "",  # HuggingFace token for pyannote diarization model download
+    "file_transcribe_num_speakers": 0,  # 0 = auto, 1-10 = fixed speaker count
+    "meetings_dir": "",  # Where meeting recordings are saved; "" = ~/Documents/Scriber Meetings
 }
 
 
