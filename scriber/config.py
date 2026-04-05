@@ -16,6 +16,8 @@ DEFAULT_CONFIG = {
     "input_device": "",
     "mode": "batch",  # "batch", "streaming", or "local"
     "local_fast_mode": False,  # If True, skips Qwen punctuation model
+    "last_update_check": 0,  # Unix timestamp of last update check
+    "skipped_update_version": "",  # Version the user clicked "Later" on
 }
 
 

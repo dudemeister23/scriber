@@ -5,7 +5,9 @@ import os
 import subprocess
 import threading
 import time
+import webbrowser
 
+import objc
 import rumps
 from AVFoundation import (
     AVCaptureDevice,
@@ -13,6 +15,7 @@ from AVFoundation import (
     AVAuthorizationStatusAuthorized,
     AVAuthorizationStatusNotDetermined,
 )
+from Foundation import NSObject
 
 from . import __version__
 from .audio import AudioRecorder
@@ -23,6 +26,7 @@ from .settings_window import SettingsWindowController
 from .local_transcribe import is_model_downloaded, transcribe_local, MODELS as LOCAL_MODELS, DEFAULT_MODEL as LOCAL_DEFAULT_MODEL
 from .streaming import StreamingTranscriber
 from .transcribe import transcribe
+from . import updater
 
 logger = logging.getLogger("scriber")
 
@@ -39,6 +43,36 @@ def _resource_path(filename: str) -> str:
 
 ICON_IDLE = _resource_path("mic_idle.png")
 ICON_RECORDING = _resource_path("mic_recording.png")
+
+
+class _MainThreadDispatcher(NSObject):
+    """Runs a queued callable on the main thread via performSelectorOnMainThread_."""
+
+    def init(self):
+        self = objc.super(_MainThreadDispatcher, self).init()
+        if self is None:
+            return None
+        self._queue = []
+        self._lock = threading.Lock()
+        return self
+
+    def enqueue_(self, callable_):
+        with self._lock:
+            self._queue.append(callable_)
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "drain:", None, False
+        )
+
+    def drain_(self, _sender):
+        while True:
+            with self._lock:
+                if not self._queue:
+                    return
+                fn = self._queue.pop(0)
+            try:
+                fn()
+            except Exception as e:
+                logger.error("Main-thread callback failed: %s", e)
 
 
 class ScribeApp(rumps.App):
@@ -92,11 +126,17 @@ class ScribeApp(rumps.App):
             None,
             self._mode_menu,
             rumps.MenuItem("Settings\u2026", callback=self._open_settings),
+            rumps.MenuItem("Check for Updates\u2026", callback=self._check_for_updates_clicked),
             None,
             rumps.MenuItem(f"Scriber v{__version__}"),
             None,
             rumps.MenuItem("Quit Scriber", callback=self.quit_app),
         ]
+
+        # Update state
+        self._update_check_in_progress = False
+        self._update_installing = False
+        self._main_dispatcher = _MainThreadDispatcher.alloc().init()
 
         # Check Accessibility permission at startup (prompts user if missing)
         rumps.Timer(self._check_accessibility_once, 1.0).start()
@@ -105,6 +145,9 @@ class ScribeApp(rumps.App):
         if not get_api_key(self.config):
             # Defer to after the run loop starts
             rumps.Timer(self._prompt_api_key_once, 0.5).start()
+
+        # Auto-check for updates 10s after startup (silent — only prompts if one is found)
+        rumps.Timer(self._auto_update_check_once, 10.0).start()
 
     def _check_accessibility_once(self, timer):
         timer.stop()
@@ -548,6 +591,180 @@ class ScribeApp(rumps.App):
                 "Hotkey Changed",
                 "Restart Scriber to apply the new hotkey.",
             )
+
+    # --- Updates ---
+
+    UPDATE_CHECK_INTERVAL = 24 * 60 * 60  # 24 hours
+
+    def _auto_update_check_once(self, timer):
+        timer.stop()
+        last = self.config.get("last_update_check", 0) or 0
+        if time.time() - last < self.UPDATE_CHECK_INTERVAL:
+            logger.debug("Skipping auto update check (last check < 24h ago)")
+            return
+        self._start_update_check(silent=True)
+
+    def _check_for_updates_clicked(self, _sender):
+        """Manual 'Check for Updates…' menu invocation."""
+        self._start_update_check(silent=False)
+
+    def _start_update_check(self, silent: bool):
+        if self._update_check_in_progress or self._update_installing:
+            return
+        self._update_check_in_progress = True
+        logger.info("Checking for updates (silent=%s)", silent)
+        thread = threading.Thread(
+            target=self._do_update_check, args=(silent,), daemon=True
+        )
+        thread.start()
+
+    def _do_update_check(self, silent: bool):
+        try:
+            release = updater.check_for_update(__version__)
+            self.config["last_update_check"] = int(time.time())
+            save_config(self.config)
+            self._on_main(lambda: self._handle_update_result(release, silent))
+        except Exception as e:
+            logger.error("Update check error: %s", e)
+            if not silent:
+                self._on_main(
+                    lambda: rumps.alert(
+                        title="Update Check Failed",
+                        message=f"Could not reach GitHub: {e}",
+                    )
+                )
+        finally:
+            self._update_check_in_progress = False
+
+    def _handle_update_result(self, release, silent: bool):
+        """Main thread: show the appropriate dialog based on check result."""
+        if release is None:
+            if not silent:
+                rumps.alert(
+                    title="Scriber is up to date",
+                    message=f"You're running v{__version__} (the latest).",
+                )
+            return
+
+        # Suppress auto-prompt for a version the user has skipped.
+        if silent and self.config.get("skipped_update_version") == release.version:
+            logger.info("Skipping prompt for %s (user deferred)", release.version)
+            return
+
+        self._prompt_update(release)
+
+    def _prompt_update(self, release):
+        has_installable = bool(release.asset_url) and updater.is_running_from_bundle()
+
+        notes = updater.format_notes(release.notes, limit=400)
+        message = f"Scriber {release.tag_name} is available. You have v{__version__}."
+        if notes:
+            message += "\n\nRelease notes:\n" + notes
+
+        if has_installable:
+            ok = "Install & Restart"
+            cancel = "Later"
+            other = "View on GitHub"
+        elif release.asset_url and not updater.is_running_from_bundle():
+            # Dev mode — no auto-install
+            message += "\n\n(Running from source — auto-install is disabled.)"
+            ok = "View on GitHub"
+            cancel = "Later"
+            other = None
+        else:
+            # No zip asset — send user to GitHub
+            message += "\n\nThis release doesn't include a pre-built binary."
+            ok = "View on GitHub"
+            cancel = "Later"
+            other = None
+
+        result = rumps.alert(
+            title="Update Available",
+            message=message,
+            ok=ok,
+            cancel=cancel,
+            other=other,
+        )
+
+        if has_installable:
+            if result == 1:  # Install & Restart
+                self._start_update_install(release)
+            elif result == -1:  # View on GitHub (other)
+                webbrowser.open(release.html_url)
+            else:  # Later
+                self.config["skipped_update_version"] = release.version
+                save_config(self.config)
+        else:
+            if result == 1:  # View on GitHub
+                webbrowser.open(release.html_url)
+            else:
+                self.config["skipped_update_version"] = release.version
+                save_config(self.config)
+
+    def _start_update_install(self, release):
+        """Kick off download + install in a background thread."""
+        if self._update_installing:
+            return
+        self._update_installing = True
+        self.status_item.title = "Downloading update\u2026"
+        thread = threading.Thread(
+            target=self._do_update_install, args=(release,), daemon=True
+        )
+        thread.start()
+
+    def _do_update_install(self, release):
+        try:
+            bundle_path = updater.get_bundle_path()
+            if not bundle_path:
+                raise RuntimeError("Could not locate the running .app bundle")
+
+            dest = os.path.join(
+                os.path.expanduser("~/Library/Application Support/Scriber/updates"),
+                release.asset_name or "Scriber.app.zip",
+            )
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+            # Throttle title updates so we don't hammer the main thread
+            last_pct = [-1]
+
+            def on_progress(received, total):
+                if total <= 0:
+                    return
+                pct = int(received * 100 / total)
+                if pct != last_pct[0]:
+                    last_pct[0] = pct
+                    self._on_main(
+                        lambda p=pct: setattr(
+                            self.status_item, "title", f"Downloading update\u2026 {p}%"
+                        )
+                    )
+
+            updater.download_release(release.asset_url, dest, progress_callback=on_progress)
+
+            self._on_main(lambda: setattr(self.status_item, "title", "Installing update\u2026"))
+            updater.stage_and_install(dest, bundle_path)
+
+            # Clear the skipped-version guard so the user isn't stuck if the install fails
+            self.config["skipped_update_version"] = ""
+            save_config(self.config)
+
+            # Give the helper script a moment to start waiting, then quit.
+            time.sleep(0.3)
+            self._on_main(self.quit_app)
+        except Exception as e:
+            logger.error("Update install failed: %s", e)
+            self._update_installing = False
+            self._on_main(lambda: self._reset_ui())
+            self._on_main(
+                lambda: rumps.alert(
+                    title="Update Failed",
+                    message=f"Could not install update: {e}",
+                )
+            )
+
+    def _on_main(self, action):
+        """Run `action` on the main thread. Safe to call from any thread."""
+        self._main_dispatcher.enqueue_(action)
 
     def quit_app(self, sender=None):
         if self._streaming_session:
