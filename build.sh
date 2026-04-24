@@ -6,6 +6,7 @@ cd "$SCRIPT_DIR"
 
 VENV_DIR=".venv"
 ENTITLEMENTS="$SCRIPT_DIR/Scriber.entitlements"
+BUILD_BACKUP_DIR="$SCRIPT_DIR/.build-backups"
 
 # Code signing identity — uses your Apple Developer cert.
 # Hardened runtime + entitlements lets macOS persist TCC permissions
@@ -23,8 +24,22 @@ pip install -q -r requirements-build.txt
 echo "==> Generating app icon..."
 python3 assets/generate_icons.py
 
-echo "==> Cleaning previous build..."
-rm -rf build dist
+echo "==> Preserving previous build artifacts..."
+if [ -d build ] || [ -d dist ]; then
+    BACKUP_STAMP="$(date +%Y%m%d-%H%M%S)"
+    BACKUP_PATH="$BUILD_BACKUP_DIR/$BACKUP_STAMP"
+    mkdir -p "$BACKUP_PATH"
+    if [ -d build ]; then
+        mv build "$BACKUP_PATH/build"
+        echo "    Moved build -> $BACKUP_PATH/build"
+    fi
+    if [ -d dist ]; then
+        mv dist "$BACKUP_PATH/dist"
+        echo "    Moved dist -> $BACKUP_PATH/dist"
+    fi
+else
+    echo "    No previous build artifacts found."
+fi
 
 echo "==> Building .app bundle..."
 python3 setup.py py2app --no-strip 2>&1

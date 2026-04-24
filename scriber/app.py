@@ -429,7 +429,7 @@ class ScribeApp(rumps.App):
                     logger.error("Paste failed: %s", pe)
                     self._overlay.show_error("Paste failed — check Accessibility permission")
                     return
-                self._overlay.hide()
+                self._overlay.complete_and_hide()
             else:
                 self._overlay.show_error("No speech detected")
         except Exception as e:
@@ -499,7 +499,7 @@ class ScribeApp(rumps.App):
                     logger.error("Paste failed: %s", pe)
                     self._overlay.show_error("Paste failed \u2014 check Accessibility permission")
                     return
-                self._overlay.hide()
+                self._overlay.complete_and_hide()
             else:
                 self._overlay.show_error("No speech detected")
         except Exception as e:
@@ -597,7 +597,7 @@ class ScribeApp(rumps.App):
             self._reset_ui()
             return
 
-        self._overlay.hide()
+        self._overlay.complete_and_hide()
         self._reset_ui()
 
     def _cancel_streaming(self):

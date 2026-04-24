@@ -1,7 +1,10 @@
 .venv
+.venv-pyinstaller/
 build/
 build 2/
 dist/
+.build-backups/
+.DS_Store
 *.pyc
 __pycache__/
 *.app
