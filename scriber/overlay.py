@@ -477,6 +477,20 @@ class _OverlayCompleteTarget(NSObject):
         self._overlay._do_complete_and_hide()
 
 
+class _OverlayShowErrorTarget(NSObject):
+    """ObjC target for showing an error message on main thread."""
+
+    def initWithOverlay_(self, overlay):
+        self = objc.super(_OverlayShowErrorTarget, self).init()
+        if self is None:
+            return None
+        self._overlay = overlay
+        return self
+
+    def doShowError_(self, message):
+        self._overlay._do_show_error(str(message))
+
+
 class RecordingOverlay:
     """Floating HUD that shows recording state and audio level."""
 
@@ -490,6 +504,7 @@ class RecordingOverlay:
         self._timer_target = _OverlayTimerTarget.alloc().initWithOverlay_(self)
         self._hide_target = _OverlayHideTarget.alloc().initWithOverlay_(self)
         self._complete_target = _OverlayCompleteTarget.alloc().initWithOverlay_(self)
+        self._show_error_target = _OverlayShowErrorTarget.alloc().initWithOverlay_(self)
         self._setup_panel()
 
     def _setup_panel(self):
@@ -666,7 +681,17 @@ class RecordingOverlay:
         return " ".join(parts) if parts else ""
 
     def show_error(self, message):
-        """Show an error message in the overlay, then auto-hide after 3 seconds."""
+        """Show an error message in the overlay, then auto-hide after 3 seconds.
+
+        Safe to call from any thread — marshals to main thread because it
+        mutates AppKit state and schedules an NSTimer (which attaches to the
+        calling thread's run loop).
+        """
+        self._show_error_target.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "doShowError:", message, False
+        )
+
+    def _do_show_error(self, message):
         self._content_view._message_text = message
         self._content_view._is_recording = False
         self._content_view._is_error = True
@@ -676,7 +701,6 @@ class RecordingOverlay:
         self._resize_to_fit()
         self._content_view.setNeedsDisplay_(True)
         logger.debug("Overlay error: %s", message)
-        # Auto-hide after 3 seconds
         NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             3.0, self._hide_target, "doHide:", None, False
         )
