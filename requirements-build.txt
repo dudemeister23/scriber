@@ -1,2 +1,1 @@
 py2app>=0.28
-pyinstaller>=6.0

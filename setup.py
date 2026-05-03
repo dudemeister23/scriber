@@ -83,8 +83,8 @@ OPTIONS = {
         "CFBundleName": "Scriber",
         "CFBundleDisplayName": "Scriber",
         "CFBundleIdentifier": "com.scriber.app",
-        "CFBundleVersion": "1.6.0",
-        "CFBundleShortVersionString": "1.6.0",
+        "CFBundleVersion": "1.6.1",
+        "CFBundleShortVersionString": "1.6.1",
         "LSUIElement": True,  # Hide from Dock (menubar-only app)
         "NSMicrophoneUsageDescription": "Scriber needs microphone access to record audio for transcription.",
         "NSAppleEventsUsageDescription": "Scriber needs accessibility access to paste transcribed text.",
